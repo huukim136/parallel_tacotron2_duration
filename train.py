@@ -1,326 +1,237 @@
-import warnings
-warnings.simplefilter(action='ignore', category=FutureWarning)
-import itertools
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+# from torch.utils.tensorboar import SummaryWriter
+from tensorboardX import SummaryWriter
+
+import numpy as np
+import argparse
 import os
 import time
-import argparse
-import json
-import torch
-import torch.nn.functional as F
-# from torch.utils.tensorboard import SummaryWriter
-from tensorboardX import SummaryWriter
-from torch.utils.data import DistributedSampler, DataLoader
-import torch.multiprocessing as mp
-from torch.distributed import init_process_group
-from torch.nn.parallel import DistributedDataParallel
-from env import AttrDict, build_env # checked
-from meldataset import MelDataset, get_dataset_filelist, mel_spectrogram # checked
-from models import Generator, MultiPeriodDiscriminator, MultiScaleDiscriminator, feature_loss, generator_loss,\
-    discriminator_loss # checked
-from utils import plot_spectrogram, scan_checkpoint, load_checkpoint, save_checkpoint, scan_checkpoint_tts # checked
-from utils_pas import plot_alignment_to_numpy
-torch.backends.cudnn.benchmark = True
 
-########### TTS #############
-from PASpeech2.fastspeech2 import FastSpeech2
-from PASpeech2.loss import FastSpeech2Loss
-# from PASpeech2 import hparams as hp
+from fastspeech2 import FastSpeech2
+from loss import FastSpeech2Loss
+from dataset import Dataset
+from optimizer import ScheduledOptim
+from evaluate import evaluate
 import hparams as hp
-import utils_pas
-import numpy as np
-import random
+import utils
+import audio as Audio
 import pdb
-############################
+import random
+from utils import plot_alignment_to_numpy
 
-def plot_attn(train_logger, C, current_step, hp):
+
+def plot_attn(train_logger, enc_attns, dec_attns, current_step, hp):
     # pdb.set_trace()
-    idx = random.randint(0, C.size(0) - 1)   
 
-    train_logger.add_image(
-        "encoder.C",
-        plot_alignment_to_numpy(C.data.cpu().numpy()[idx].T),
-        current_step)
+    idx = random.randint(0, enc_attns[0].size(0) - 1)
+    for i in range(len(enc_attns)):
+        train_logger.add_image(
+            "encoder.attns_layer_%s"%i,
+            plot_alignment_to_numpy(enc_attns[i].data.cpu().numpy()[idx].T),
+            current_step)
 
-    # train_logger.add_image(
-    #     "encoder.E",
-    #     plot_alignment_to_numpy(E.data.cpu().numpy()[idx].T),
-    #     current_step)
+        train_logger.add_image(
+            "decoder.attns_layer_%s"%i,
+            plot_alignment_to_numpy(dec_attns[i].data.cpu().numpy()[idx].T),
+            current_step)
+     
 
-    # train_logger.add_image(
-    #     "encoder.W",
-    #     plot_alignment_to_numpy(W.data.cpu().numpy()[idx].T),
-    #     current_step)
+def main(args):
+    torch.manual_seed(0)
 
-def train(rank, a, h):
-    torch.cuda.manual_seed(h.seed)
-    device = torch.device('cuda:{:d}'.format(rank))
-
-    generator = Generator(h).to(device)
-    mpd = MultiPeriodDiscriminator().to(device)
-    msd = MultiScaleDiscriminator().to(device)
-    model_tts = FastSpeech2().to(device) # TTS on device
-
-    if rank == 0:
-        os.makedirs(a.checkpoint_path, exist_ok=True)
-        print("checkpoints directory : ", a.checkpoint_path)
-
-    if os.path.isdir(a.checkpoint_path):
-        cp_g = scan_checkpoint(a.checkpoint_path, 'g_')
-        cp_do = scan_checkpoint(a.checkpoint_path, 'do_')
-
-    steps = 0
-    if cp_g is None or cp_do is None:
-        state_dict_do = None
-        last_epoch = -1
-        print('checkpoint not found. begin from 0')
-    else:
-        state_dict_g = load_checkpoint(cp_g, device)
-        state_dict_do = load_checkpoint(cp_do, device)
-        generator.load_state_dict(state_dict_g['generator'])
-        model_tts.load_state_dict(state_dict_g['model'])
-        mpd.load_state_dict(state_dict_do['mpd'])
-        msd.load_state_dict(state_dict_do['msd'])
-        steps = state_dict_do['steps'] + 1
-        last_epoch = state_dict_do['epoch']
-        print('checkpoint loaded from ', a.checkpoint_path)
-
-    optim_g = torch.optim.AdamW(itertools.chain(generator.parameters(), model_tts.parameters())
-                                , h.learning_rate, betas=[h.adam_b1, h.adam_b2])
-    optim_d = torch.optim.AdamW(itertools.chain(msd.parameters(), mpd.parameters())
-                                , h.learning_rate, betas=[h.adam_b1, h.adam_b2])
+    # Get device
+    device = torch.device('cuda'if torch.cuda.is_available()else 'cpu')
     
-    if state_dict_do is not None:
-        optim_g.load_state_dict(state_dict_do['optim_g'])
-        optim_d.load_state_dict(state_dict_do['optim_d'])
+    # Get dataset
+    dataset = Dataset("train.txt") 
+    loader = DataLoader(dataset, batch_size=hp.batch_size**2, shuffle=True, 
+        collate_fn=dataset.collate_fn, drop_last=True, num_workers=0)
 
-    ##
-    torch.nn.utils.clip_grad_norm_(generator.parameters(),1.0)
-    torch.nn.utils.clip_grad_norm_(mpd.parameters(),1.0)
-    torch.nn.utils.clip_grad_norm_(msd.parameters(),1.0)
-    torch.nn.utils.clip_grad_norm_(model_tts.parameters(), 1.0) # TTS    
-    ##
+    # Define model
+    # model = nn.DataParallel(FastSpeech2()).to(device)
+    model = FastSpeech2().to(device)
+    print("Model Has Been Defined")
+    num_param = utils.get_param_num(model)
+    print('Number of FastSpeech2 Parameters:', num_param)
 
-    scheduler_g = torch.optim.lr_scheduler.ExponentialLR(optim_g, gamma=h.lr_decay, last_epoch=last_epoch)
-    scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optim_d, gamma=h.lr_decay, last_epoch=last_epoch)
+    # Optimizer and loss
+    optimizer = torch.optim.Adam(model.parameters(), betas=hp.betas, eps=hp.eps, weight_decay = hp.weight_decay)
+    scheduled_optim = ScheduledOptim(optimizer, hp.decoder_hidden, hp.n_warm_up_step, args.restore_step)
+    Loss = FastSpeech2Loss().to(device) 
+    print("Optimizer and Loss Function Defined.")
 
-    tts_loss = FastSpeech2Loss().to(device)
+    # Load checkpoint if exists
+    checkpoint_path = os.path.join(hp.checkpoint_path)
+    try:
+        checkpoint = torch.load(os.path.join(
+            checkpoint_path, 'checkpoint_{}.pth.tar'.format(args.restore_step)))
+        model.load_state_dict(checkpoint['model'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        print("\n---Model Restored at Step {}---\n".format(args.restore_step))
+    except:
+        print("\n---Start New Training---\n")
+        if not os.path.exists(checkpoint_path):
+            os.makedirs(checkpoint_path)
 
-    training_data, validation_data = get_dataset_filelist(a)
-    trainset = MelDataset(training_data, h.segment_size, h.num_mels, h.sampling_rate, n_cache_reuse=0, shuffle= True, device=device)
-    train_loader = DataLoader(trainset, num_workers=h.num_workers, shuffle=True, sampler=None, 
-                              collate_fn=training_data.collate_fn, batch_size=hp.batch_size, pin_memory=True, drop_last=True)
+    # Load vocoder
+    if hp.vocoder == 'melgan':
+        melgan = utils.get_melgan()
+        melgan.to(device)
+    elif hp.vocoder == 'waveglow':
+        waveglow = utils.get_waveglow()
+        waveglow.to(device)
 
-    if rank == 0:
-        validset = MelDataset(validation_data, h.segment_size, h.num_mels, h.sampling_rate, False, False, n_cache_reuse=0, device=device)
-        validation_loader = DataLoader(validset, num_workers=1, shuffle=False, sampler=None, 
-                                       collate_fn=validation_data.collate_fn, batch_size=1, pin_memory=True, drop_last=True)
-        sw = SummaryWriter(os.path.join(a.checkpoint_path, 'logs'))
+    # Init logger
+    log_path = hp.log_path
+    if not os.path.exists(log_path):
+        os.makedirs(log_path)
+        os.makedirs(os.path.join(log_path, 'train'))
+        os.makedirs(os.path.join(log_path, 'validation'))
+    train_logger = SummaryWriter(os.path.join(log_path, 'train'))
+    val_logger = SummaryWriter(os.path.join(log_path, 'validation'))
 
-    # training
-    generator.train()
-    mpd.train()
-    msd.train()
-    model_tts.train()
-    for epoch in range(max(0, last_epoch), a.training_epochs):
-        if rank == 0:
-            start = time.time()
-            print("Epoch: {}".format(epoch+1))
+    # Init synthesis directory
+    synth_path = hp.synth_path
+    if not os.path.exists(synth_path):
+        os.makedirs(synth_path)
 
-        for i, batch in enumerate(train_loader):
-            if rank == 0: start_b = time.time()
-            y, tts_data, audio_start = batch
-            ### for TTS data
-            text = torch.from_numpy(tts_data['text']).long().to(device)
+    # Define Some Information
+    Time = np.array([])
+    Start = time.perf_counter()
+    
+    # Training
+    model = model.train()
+    # pdb.set_trace()
+    for epoch in range(hp.epochs):
+        # Get Training Loader
+        total_step = hp.epochs * len(loader) * hp.batch_size
 
-            D = torch.from_numpy(tts_data['D']).long().to(device)
-            log_D = torch.from_numpy(tts_data['log_D']).float().to(device)
-            f0 = torch.from_numpy(tts_data['f0']).float().to(device)
-            energy = torch.from_numpy(tts_data['energy']).float().to(device)
+        for i, batchs in enumerate(loader):
+            for j, data_of_batch in enumerate(batchs):
+                start_time = time.perf_counter()
 
-            src_len = torch.from_numpy(tts_data['src_len']).long().to(device)
-            mel_len = torch.from_numpy(tts_data['mel_len']).long().to(device)
-            max_src_len = np.max(tts_data['src_len']).astype(np.int32)
-            max_mel_len = np.max(tts_data['mel_len']).astype(np.int32)
+                current_step = i*hp.batch_size + j + args.restore_step + epoch*len(loader)*hp.batch_size + 1
+                
+                # Get Data
+                text = torch.from_numpy(data_of_batch["text"]).long().to(device)
+                mel_target = torch.from_numpy(data_of_batch["mel_target"]).float().to(device)
+                D = torch.from_numpy(data_of_batch["D"]).long().to(device)
+                log_D = torch.from_numpy(data_of_batch["log_D"]).float().to(device)
+                f0 = torch.from_numpy(data_of_batch["f0"]).float().to(device)
+                energy = torch.from_numpy(data_of_batch["energy"]).float().to(device)
+                src_len = torch.from_numpy(data_of_batch["src_len"]).long().to(device)
+                mel_len = torch.from_numpy(data_of_batch["mel_len"]).long().to(device)
+                max_src_len = np.max(data_of_batch["src_len"]).astype(np.int32)
+                max_mel_len = np.max(data_of_batch["mel_len"]).astype(np.int32)
+                
+                # Forward
+                mel_output, mel_postnet_output, duration_output, src_mask, pred_mel_mask, enc_attns, dec_attns, W = model(
+                    text, src_len, mel_len, max_src_len, max_mel_len)
+                # Cal Loss
+                mel_loss, mel_postnet_loss, d_loss= Loss(
+                        duration_output, mel_len, mel_output, mel_postnet_output, mel_target, src_mask, pred_mel_mask)
+                total_loss = mel_loss + mel_postnet_loss + d_loss
+                 
+                # Logger
+                t_l = total_loss.item()
+                m_l = mel_loss.item()
+                m_p_l = mel_postnet_loss.item()
+                d_l = d_loss.item()
+                 
+                # Backward
+                total_loss = total_loss / hp.acc_steps
+                total_loss.backward()
+                if current_step % hp.acc_steps != 0:
+                    continue
 
-            ###### TTS forward
-            y = torch.stack(y) # batch, segment length
-            y = torch.autograd.Variable(y.to(device, non_blocking=True)) # wav to device
-            y = y.unsqueeze(1)
+                # Clipping gradients to avoid gradient explosion
+                nn.utils.clip_grad_norm_(model.parameters(), hp.grad_clip_thresh)
 
-            # text -> [encoder] -> [var_adapt] -> var_output + pos_emb => mel_output
-            # mel_output, log_duration_output, f0_output, energy_output, src_mask, mel_mask, _, S, E = model_tts(
-            #     text, src_len, mel_len, D, f0, energy, max_src_len, max_mel_len)
-            mel_output, d, f0_output, energy_output, src_mask, mel_mask, _, C = model_tts(
-                text, src_len, mel_len, D, f0, energy, max_src_len, max_mel_len)
-            plot_attn(sw, C, steps, hp)
+                # Update weights
+                scheduled_optim.step_and_update_lr()
+                scheduled_optim.zero_grad()
+                
+                # Print
+                if current_step % hp.log_step == 0:
+                    Now = time.perf_counter()
 
-            # sync
-            indices = torch.tensor(audio_start)
-            x_hat = []
-            for i, idx in enumerate(indices):
-                chunk = mel_output[i,idx:idx + y.size(-1)//hp.hop_length,:] # actually, var + text_emb
-                x_hat.append(chunk)
-            x_hat = torch.stack(x_hat).transpose(1,2)
-            y_g_hat = generator(x_hat) # use output of TTS
+                    str1 = "Epoch [{}/{}], Step [{}/{}]:".format(
+                        epoch+1, hp.epochs, current_step, total_step)
+                    str2 = "Total Loss: {:.4f}, Mel Loss: {:.4f}, Mel PostNet Loss: {:.4f}, Duration Loss: {:.4f};".format(
+                        t_l, m_l, m_p_l, d_l)
+                    str3 = "Time Used: {:.3f}s, Estimated Time Remaining: {:.3f}s.".format(
+                        (Now-Start), (total_step-current_step)*np.mean(Time))
 
-            y_mel = mel_spectrogram(y.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size, h.fmin, h.fmax_for_loss)
-            y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size, h.fmin, h.fmax_for_loss)
+                    print("\n" + str1)
+                    print(str2)
+                    print(str3)
+                    
+                    with open(os.path.join(log_path, "log.txt"), "a") as f_log:
+                        f_log.write(str1 + "\n")
+                        f_log.write(str2 + "\n")
+                        f_log.write(str3 + "\n")
+                        f_log.write("\n")
 
-            ## Discriminator
-            optim_d.zero_grad()
+                    train_logger.add_scalar('Loss/total_loss', t_l, current_step)
+                    train_logger.add_scalar('Loss/mel_loss', m_l, current_step)
+                    train_logger.add_scalar('Loss/mel_postnet_loss', m_p_l, current_step)
+                    train_logger.add_scalar('Loss/duration_loss', d_l, current_step)
 
-            # MPD
-            y_df_hat_r, y_df_hat_g, _, _ = mpd(y, y_g_hat.detach())
-            loss_disc_f, losses_disc_f_r, losses_disc_f_g = discriminator_loss(y_df_hat_r, y_df_hat_g)
+                    plot_attn(train_logger, enc_attns, dec_attns, current_step, hp)
+                
+                if current_step % hp.save_step == 0:
+                    torch.save({'model': model.state_dict(), 'optimizer': optimizer.state_dict(
+                    )}, os.path.join(checkpoint_path, 'checkpoint_{}.pth.tar'.format(current_step)))
+                    print("save model at step {} ...".format(current_step))
 
-            # MSD
-            y_ds_hat_r, y_ds_hat_g, _, _ = msd(y, y_g_hat.detach())
-            loss_disc_s, losses_disc_s_r, losses_disc_s_g = discriminator_loss(y_ds_hat_r, y_ds_hat_g)
+                if current_step % hp.synth_step == 0:
+                    length = mel_len[0].item()
+                    mel_target_torch = mel_target[0, :length].detach().unsqueeze(0).transpose(1, 2)
+                    mel_target = mel_target[0, :length].detach().cpu().transpose(0, 1)
+                    mel_torch = mel_output[0, :length].detach().unsqueeze(0).transpose(1, 2)
+                    mel = mel_output[0, :length].detach().cpu().transpose(0, 1)
+                    mel_postnet_torch = mel_postnet_output[0, :length].detach().unsqueeze(0).transpose(1, 2)
+                    mel_postnet = mel_postnet_output[0, :length].detach().cpu().transpose(0, 1)
+                    Audio.tools.inv_mel_spec(mel, os.path.join(synth_path, "step_{}_griffin_lim.wav".format(current_step)))
+                    Audio.tools.inv_mel_spec(mel_postnet, os.path.join(synth_path, "step_{}_postnet_griffin_lim.wav".format(current_step)))
+                    
+                    if hp.vocoder == 'melgan':
+                        utils.melgan_infer(mel_torch, melgan, os.path.join(hp.synth_path, 'step_{}_{}.wav'.format(current_step, hp.vocoder)))
+                        utils.melgan_infer(mel_postnet_torch, melgan, os.path.join(hp.synth_path, 'step_{}_postnet_{}.wav'.format(current_step, hp.vocoder)))
+                        utils.melgan_infer(mel_target_torch, melgan, os.path.join(hp.synth_path, 'step_{}_ground-truth_{}.wav'.format(current_step, hp.vocoder)))
+                    elif hp.vocoder == 'waveglow':
+                        utils.waveglow_infer(mel_torch, waveglow, os.path.join(hp.synth_path, 'step_{}_{}.wav'.format(current_step, hp.vocoder)))
+                        utils.waveglow_infer(mel_postnet_torch, waveglow, os.path.join(hp.synth_path, 'step_{}_postnet_{}.wav'.format(current_step, hp.vocoder)))
+                        utils.waveglow_infer(mel_target_torch, waveglow, os.path.join(hp.synth_path, 'step_{}_ground-truth_{}.wav'.format(current_step, hp.vocoder)))
 
-            loss_disc_all = loss_disc_s + loss_disc_f
-
-            loss_disc_all.backward()
-            optim_d.step()
-           
-
-            ## Generator
-            optim_g.zero_grad()
-
-            ### include TTS parts
-            # Cal loss
-            d_loss, f_loss, e_loss = tts_loss(d, f0_output, f0, energy_output, energy, ~src_mask, ~mel_mask)
-            total_tts_loss = d_loss + f_loss + e_loss # actually variance adaptor error
-
-            t_l = total_tts_loss.item()
-            d_l = d_loss.item()
-            f_l = f_loss.item()
-            e_l = e_loss.item()
-            
-            # L1 Mel-Spectrogram Loss
-            loss_mel = F.l1_loss(y_mel, y_g_hat_mel) * 45
-
-            y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = mpd(y, y_g_hat)
-            y_ds_hat_r, y_ds_hat_g, fmap_s_r, fmap_s_g = msd(y, y_g_hat)
-            loss_fm_f = feature_loss(fmap_f_r, fmap_f_g)
-            loss_fm_s = feature_loss(fmap_s_r, fmap_s_g)
-            loss_gen_f, losses_gen_f = generator_loss(y_df_hat_g)
-            loss_gen_s, losses_gen_s = generator_loss(y_ds_hat_g)
-            loss_gen_all = loss_gen_s + loss_gen_f + loss_fm_s + loss_fm_f + loss_mel \
-                           + total_tts_loss # added for TTS
-
-            loss_gen_all.backward()
-            optim_g.step()
-
-            if rank == 0:
-                # STDOUT logging
-                if steps % a.stdout_interval == 0:
+                
+                if current_step % hp.eval_step == 0:
+                    model.eval()
                     with torch.no_grad():
-                        mel_error = F.l1_loss(y_mel, y_g_hat_mel).item()
+                        d_l, m_l, m_p_l = evaluate(model, current_step)
+                        t_l = d_l + m_l + m_p_l
+                        
+                        val_logger.add_scalar('Loss/total_loss', t_l, current_step)
+                        val_logger.add_scalar('Loss/mel_loss', m_l, current_step)
+                        val_logger.add_scalar('Loss/mel_postnet_loss', m_p_l, current_step)
+                        val_logger.add_scalar('Loss/duration_loss', d_l, current_step)
 
-                    print('GAN Steps : {:d}, Gen Loss Total : {:4.3f}, Mel-Spec. Error : {:4.3f}, s/b : {:4.3f}'.
-                          format(steps, loss_gen_all, mel_error, time.time() - start_b))
-                    print('TTS steps : Total loss: {:.4f}, Duration loss: {:.4f}, F0 loss: {:.4f}, E loss: {:.4f}'.
-                          format(t_l, d_l, f_l, e_l))
-                    print()
+                    model.train()
 
-                # checkpointing
-                if steps % a.checkpoint_interval == 0 and steps != 0:
-                    checkpoint_path = "{}/g_{:08d}".format(a.checkpoint_path, steps)
-                    save_checkpoint(checkpoint_path,
-                                    {'generator': generator.state_dict(),
-                                     'model': model_tts.state_dict()})
-                    checkpoint_path = "{}/do_{:08d}".format(a.checkpoint_path, steps)
-                    save_checkpoint(checkpoint_path, 
-                                    {'mpd': mpd.state_dict(),
-                                     'msd': msd.state_dict(),
-                                     'optim_g': optim_g.state_dict(), 
-                                     'optim_d': optim_d.state_dict(),
-                                     'steps': steps,
-                                     'epoch': epoch})
+                end_time = time.perf_counter()
+                Time = np.append(Time, end_time - start_time)
+                if len(Time) == hp.clear_Time:
+                    temp_value = np.mean(Time)
+                    Time = np.delete(
+                        Time, [i for i in range(len(Time))], axis=None)
+                    Time = np.append(Time, temp_value)
 
-                # Tensorboard summary logging
-                if steps % a.summary_interval == 0:
-                    sw.add_scalar("training/gen_loss_total", loss_gen_all, steps)
-                    sw.add_scalar("training/mel_spec_error", mel_error, steps)
-                    sw.add_scalar("training/pitch_error", f_loss, steps)
-                    sw.add_scalar("training/energy_error", e_loss, steps)
-                    sw.add_scalar("training/duration_error", d_loss, steps)
+if __name__ == "__main__":
 
-                # Validation
-                if steps % a.validation_interval == 0:  # and steps != 0:
-                    generator.eval()
-                    model_tts.eval()
-                    torch.cuda.empty_cache()
-                    val_err_tot = 0
-                    with torch.no_grad():
-                        for j, batch in enumerate(validation_loader):
-                            y, val_tts_data, _ = batch
-                            ##########
-                            v_id = val_tts_data['id']
-                            v_text = torch.from_numpy(val_tts_data['text']).long().to(device)
-                            v_D = torch.from_numpy(val_tts_data['D']).long().to(device)
-                            v_log_D = torch.from_numpy(val_tts_data['log_D']).float().to(device)
-                            v_f0 = torch.from_numpy(val_tts_data['f0']).float().to(device)
-                            v_energy = torch.from_numpy(val_tts_data['energy']).float().to(device)
-                            v_src_len = torch.from_numpy(val_tts_data['src_len']).long().to(device)
-                            v_mel_len = torch.from_numpy(val_tts_data['mel_len']).long().to(device)
-                            v_max_src_len = np.max(val_tts_data['src_len']).astype(np.int32)
-                            v_max_mel_len = np.max(val_tts_data['mel_len']).astype(np.int32)
-                            y = torch.stack(y)
-                            v_mel_output, v_d, v_f0_output, v_energy_output, v_src_mask, v_mel_mask, v_out_mel_len, C= model_tts(
-                                v_text, v_src_len, v_mel_len, v_D, v_f0, v_energy, v_max_src_len, v_max_mel_len)
-                            ##########
-                            y_g_hat = generator(v_mel_output.transpose(1,2))
-                            y_mel = mel_spectrogram(y.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size, h.fmin, h.fmax_for_loss)
-                            y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size, h.fmin, h.fmax_for_loss)
-                            ##########
-                            if j <= 4:
-                                if steps == 0:
-                                    sw.add_audio('gt/y_{}'.format(j), y[0], steps, h.sampling_rate)
-                                    sw.add_image('gt/y_spec_{}'.format(j), plot_alignment_to_numpy(y_mel[0].cpu()), steps)
-                                sw.add_audio('generated/y_hat_{}'.format(j), y_g_hat[0], steps, h.sampling_rate)
-                                y_hat_spec = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size, h.fmin, h.fmax)
-                                sw.add_image('generated/y_hat_spec_{}'.format(j), plot_alignment_to_numpy(y_hat_spec.squeeze(0).cpu().numpy()), steps)
-
-                    generator.train()
-                    model_tts.train()
-
-            steps += 1
-
-        scheduler_g.step()
-        scheduler_d.step()
-        
-        if rank == 0:
-            print('Time taken for epoch {} is {} sec\n'.format(epoch + 1, int(time.time() - start)))
-
-def main():
-    print('Initializing Training Process..')
     parser = argparse.ArgumentParser()
-    parser.add_argument('--group_name', default=None)
-    parser.add_argument('--input_wavs_dir', default='LJSpeech-1.1/wavs_float') # convert to float32
-    parser.add_argument('--input_training_file', default='train.txt')
-    parser.add_argument('--input_validation_file', default='val.txt')
-    parser.add_argument('--checkpoint_path', default='/home/hk/log_and_save/hispeech/cp_duration_EATS')
-    parser.add_argument('--config', default='')
-    parser.add_argument('--training_epochs', default=3100, type=int)
-    parser.add_argument('--stdout_interval', default=5, type=int)
-    parser.add_argument('--checkpoint_interval', default=15000, type=int)
-    parser.add_argument('--summary_interval', default=200, type=int)
-    parser.add_argument('--validation_interval', default=5000, type=int)
-    a = parser.parse_args()
+    parser.add_argument('--restore_step', type=int, default=0)
+    args = parser.parse_args()
 
-    with open(a.config) as f: data = f.read()
-    json_config = json.loads(data)
-    h = AttrDict(json_config)
-    build_env(a.config, 'config.json', a.checkpoint_path)
-    torch.manual_seed(h.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(h.seed)
-        h.num_gpus = torch.cuda.device_count()
-        h.batch_size = int(h.batch_size / h.num_gpus)
-        print('Batch size per GPU :', h.batch_size)
-    else: pass
-    train(0, a, h)
-
-if __name__ == '__main__':
-    main()
+    main(args)
