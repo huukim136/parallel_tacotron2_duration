@@ -3,6 +3,7 @@ This is an unofficial implementation of the **Duration Predictor** and **Learned
 
 ## Preprocessing
 
+LJSpeech dataset is used for training.
 Please refer to [this repository](https://github.com/ming024/FastSpeech2) for more information about preprocessing.
 
 ## Training 
